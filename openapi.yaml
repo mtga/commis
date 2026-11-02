@@ -1,0 +1,2876 @@
+openapi: 3.0.3
+info:
+  title: "Кадровые комиссии — фаза A"
+  description: |
+    Контракт сервиса «Кадровые комиссии» для фазы A — «Создание и запуск КК».
+    Срез 1 (`add-commission-draft-core`) — исходный фрагмент. Остальные операции добавлены
+    по нарезке фазы A, у каждой в `x-slice` указан change, в котором она появляется.
+    Proposal каждого change берёт из этого файла свои операции и схемы.
+
+    | Change | Что добавляет в API |
+    | --- | --- |
+    | 1 `add-commission-draft-core` | `POST /commissions`, `GET` и `PATCH /commissions/{commissionId}` |
+    | 2 `add-commission-list` | `GET /commissions`, `DELETE /commissions/{commissionId}` |
+    | A3 `add-commission-grades` | `GET /grades`, поле `gradeCodes` в параметрах |
+    | A4 `add-commission-departments` | `GET /org-units`, выбор и снятие подразделений КК |
+    | B5 `add-commission-stages` | этапы КК и их порядок |
+    | C6 `add-decision-templates` | шаблоны проектов решений, варианты, поля контекста |
+    | C8 `add-commission-template-binding` | поле `decisionTemplateId` в параметрах |
+    | D9 `add-draft-assessees` | кандидаты подразделения, включение, правка причины, исключение |
+    | 14 `add-commission-owners` | владельцы комиссии; доступ к остальным операциям расширяется |
+    | 15 `add-directories-admin` | `/admin/process-owners`, `/admin/hrd-assignments` |
+    | C7 `add-decision-template-copy-archive` | копия и архив шаблона |
+    | D10 `add-manual-assessee` | `GET /people/search`, ручное добавление оцениваемого |
+    | 13 `add-commission-clone` | `POST /commissions/{commissionId}/clone` |
+    | 11 `add-commission-activation` | `POST /commissions/{commissionId}/activation` |
+    | 12 `add-activation-events` | в API ничего не добавляет: outbox и события внутренние |
+
+    Общие правила:
+    - Все эндпоинты требуют JWT. `person_id` берётся из токена библиотекой авторизации.
+    - Роль проверяется на каждой операции, иначе `403 ACCESS_DENIED`, ничего не меняется.
+      - Владелец процесса — активная запись в `process_owner`. Видит и правит все КК.
+      - Владелец комиссии (с change 14) — запись в `commission_owner` для этой КК.
+        Внутри неё может всё, что владелец процесса, кроме создания КК и «Создать на основе».
+      - Роль поддержки (change 15) — роль из библиотеки авторизации, только `/admin/*`.
+    - Ресурс не существует — `404` с кодом `*_NOT_FOUND`.
+    - Правка черновика вне статуса `DRAFT` — `409 COMMISSION_NOT_DRAFT`.
+    - Недопустимое значение — `422 VALIDATION_FAILED`, ничего не меняется. Поля-нарушители — в `fields`.
+    - Конфликт с инвариантом домена — `409` с отдельным кодом, ничего не меняется.
+    - `OrgStructure` или система грейдов недоступны — `503 EXTERNAL_SERVICE_UNAVAILABLE`.
+      `PersonProfile` недоступен — ответ приходит без ФИО, с `personProfileAvailable: false`.
+    - Все правки черновика возвращают актуальную КК с заполненностью, кроме оцениваемых:
+      их операции возвращают оцениваемого и заполненность, потому что список может быть большим.
+    - Даты — ISO-8601: `date-time` в UTC, `date` — календарная дата. `personId` — UUID из `PersonProfile`,
+      `orgUnitId` — UUID из `OrgStructure`.
+    - Лимиты длины строк — предложение. Окончательные значения фиксирует design.md своего change.
+  version: 0.2.0
+
+tags:
+  - name: Commission
+    description: "Кадровая комиссия: черновик, список, удаление, активация, копирование"
+  - name: Grades
+    description: "Справочник грейдов (внешняя система)"
+  - name: Departments
+    description: "Подразделения комиссии и кандидаты из `OrgStructure`"
+  - name: Stages
+    description: "Этапы проведения"
+  - name: Assessees
+    description: "Оцениваемые и причина рассмотрения"
+  - name: People
+    description: "Поиск сотрудников (`PersonProfile`)"
+  - name: DecisionTemplates
+    description: "Шаблоны проектов решений"
+  - name: Owners
+    description: "Владельцы комиссии («Настроить доступ»)"
+  - name: Admin
+    description: "Справочники для роли поддержки"
+
+paths:
+  /commissions:
+    get:
+      summary: Список комиссий
+      description: |
+        Главная (FR-A01). Владелец процесса видит все КК всех владельцев. Владелец комиссии
+        (с change 14) видит только КК, к которым ему выдан доступ. Остальным — пустой список.
+
+        Сортировка — по дате создания, новые сверху. КК без названия приходит с `title: null`,
+        а «Без названия» подставляет клиент. Фильтр по срокам появится позже.
+      operationId: listCommissions
+      tags: [Commission]
+      x-slice: add-commission-list
+      parameters:
+        - name: type
+          in: query
+          description: "Фильтр по типу; можно передать несколько значений"
+          required: false
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/CommissionTypeValue"
+        - name: status
+          in: query
+          description: "Фильтр по статусу; можно передать несколько значений"
+          required: false
+          style: form
+          explode: true
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/CommissionStatus"
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Size"
+      responses:
+        '200':
+          description: Страница списка
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionListPage"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+
+    post:
+      summary: Создать черновик комиссии
+      description: |
+        Создаёт КК в статусе `DRAFT` вместе с первым изменением формы (FR-A02).
+
+        «+» в интерфейсе открывает пустую форму и запрос не отправляет — клиент вызывает эндпоинт
+        только после первого изменения. Id присваивает сервер.
+
+        Тело — объект первого изменения: `null`, пустой массив или отсутствующее поле означают
+        «не задано». Хотя бы одно поле должно быть задано, иначе `422`. Какие поля доступны,
+        зависит от change: в срезе 1 — `title`, `regulation`, `type`; дальше каждый срез, который
+        добавляет данные черновика, добавляет и своё поле первого изменения (см. схему).
+
+        В одной транзакции пишутся строка `personnel_commission`, переход `null → DRAFT`
+        в `commission_status_history` и дочерние строки первого изменения (подразделение или этап).
+        `created_by` и `updated_by` равны автору — `person_id` из токена.
+
+        Создавать КК может только владелец процесса, в том числе после change 14.
+
+        Защиты от повторного `POST` нет (решение 02.11): клиент не повторяет запрос, а случайный
+        дубль на обрыве связи владелец удалит сам. Пока `POST` не ответил, клиент держит следующие
+        правки в очереди и после `201` отправляет их отдельными запросами.
+      operationId: createCommissionDraft
+      tags: [Commission]
+      x-slice: add-commission-draft-core
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommissionDraftRequest"
+            examples:
+              firstTitle:
+                summary: Первое изменение — название
+                value:
+                  title: "Центральный аппарат"
+              firstType:
+                summary: Первое изменение — тип
+                value:
+                  type: ALPHA
+              firstDepartment:
+                summary: Первое изменение — подразделение (с change A4)
+                value:
+                  departmentOrgUnitIds: ["7f1c2b8e-3a0d-4f6e-9b1a-2c5d8e9f0a11"]
+              firstStage:
+                summary: Первое изменение — этап (с change B5)
+                value:
+                  stages:
+                    - title: "Подготовка списков"
+      responses:
+        '201':
+          description: Черновик создан
+          headers:
+            Location:
+              description: "URL созданного ресурса, `/commissions/{commissionId}`"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /commissions/{commissionId}:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+
+    get:
+      summary: Получить комиссию
+      description: |
+        Открытие КК. Отдаёт статус, параметры проведения, автора с ФИО, даты создания
+        и последнего изменения, подразделения (с change A4), этапы (с change B5)
+        и заполненность мастера.
+
+        В черновике название, руководитель и HRD подразделения берутся из `OrgStructure`
+        и `HrdResolver` при каждом запросе. После активации (change 11) — из снимка.
+
+        ФИО запрашиваются у `PersonProfilePort` пакетом. Если профиль недоступен, КК всё равно
+        открывается: у людей `fullName: null`, а в ответе `personProfileAvailable: false`.
+
+        Оцениваемые в ответ не входят — они загружаются по подразделению.
+      operationId: getCommission
+      tags: [Commission]
+      x-slice: add-commission-draft-core
+      responses:
+        '200':
+          description: Комиссия
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+
+    patch:
+      summary: Автосохранение параметров проведения
+      description: |
+        Частичная правка параметров проведения черновика. Сохраняются только переданные поля;
+        `null` в теле означает «очистить поле», отсутствие поля — «не трогать».
+
+        Поля по change: `title`, `regulation`, `type` — срез 1; `gradeCodes` — A3;
+        `decisionTemplateId` — C8.
+
+        Правка допустима только в `DRAFT`, иначе `409`. Значение проверяет агрегат:
+        - тип — только `ALPHA` / `BETA` / `GAMMA`, `title` ≤ 200 символов, `regulation` ≤ 4000;
+        - `gradeCodes` — только коды из системы грейдов, без повторов;
+        - `decisionTemplateId` — существующий шаблон не в архиве.
+
+        Нарушение — `422`, черновик не меняется.
+
+        `updated_by` и `updated_at` обновляются автоматически. Оптимистической блокировки нет:
+        при одновременных правках одного поля сохраняется последнее изменение (last-write-wins).
+
+        Очистка всех полей не удаляет КК: она остаётся черновиком с `complete: false`.
+        Если убрать грейд, уже включённые оцениваемые не меняются: грейды — фильтр, а не ограничение.
+      operationId: updateCommissionParams
+      tags: [Commission]
+      x-slice: add-commission-draft-core
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommissionParamsPatch"
+            examples:
+              renameDraft:
+                summary: Правка названия
+                value:
+                  title: "Центральный аппарат — ротации"
+              clearType:
+                summary: Очистка типа
+                value:
+                  type: null
+              setGrades:
+                summary: Выбор грейдов (с change A3)
+                value:
+                  gradeCodes: ["G14", "G15"]
+              bindTemplate:
+                summary: Выбор шаблона (с change C8)
+                value:
+                  decisionTemplateId: "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"
+      responses:
+        '200':
+          description: Правка сохранена, ответ — актуальная заполненность и параметры
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+    delete:
+      summary: Удалить черновик
+      description: |
+        Физическое удаление черновика вместе со всеми дочерними строками (FR-A14):
+        подразделениями, этапами, оцениваемыми, историей статусов, владельцами комиссии.
+        Шаблон проектов решений не удаляется — удаляется только привязка.
+
+        Удалить можно только КК в `DRAFT`, иначе `409`. Удаляют владелец процесса
+        и (с change 14) владелец этой комиссии.
+      operationId: deleteCommissionDraft
+      tags: [Commission]
+      x-slice: add-commission-list
+      responses:
+        '204':
+          description: Черновик удалён
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+
+  /commissions/{commissionId}/activation:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+    post:
+      summary: Активировать комиссию («Создать»)
+      description: |
+        Переводит КК из `DRAFT` в `ACTIVE` (FR-A10, FR-A11, FR-X04). В одной транзакции:
+        - агрегат проверяет все правила заполненности — при нарушении `422 COMMISSION_INCOMPLETE`
+          с заполненностью в `details.completeness`;
+        - проверяет тип — в MVP активируется только `ALPHA`, иначе `422 COMMISSION_TYPE_NOT_ACTIVATABLE`;
+        - фиксирует снимок каждого подразделения: название, руководитель, HRD через `HrdResolver`,
+          `snapshotAt`; привязка оцениваемых к подразделениям фиксируется, атрибуты людей — нет (ADR-0001);
+        - ставит подразделениям статус `NOT_FILLED`;
+        - пишет переход `DRAFT → ACTIVE` в историю статусов;
+        - привязанный шаблон становится используемым: правка и удаление шаблона дальше дают `409`;
+        - с change 12 — кладёт события «КК активирована» в outbox, по одному на подразделение.
+
+        После активации параметры проведения, подразделения и этапы не меняются (`409`).
+        Активируют владелец процесса и (с change 14) владелец этой комиссии.
+      operationId: activateCommission
+      tags: [Commission]
+      x-slice: add-commission-activation
+      responses:
+        '200':
+          description: КК активирована, ответ — КК со снимком подразделений
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+        '422':
+          description: |
+            КК нельзя активировать: не заполнены обязательные поля (`COMMISSION_INCOMPLETE`)
+            или тип не `ALPHA` (`COMMISSION_TYPE_NOT_ACTIVATABLE`). Ничего не меняется.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                incomplete:
+                  summary: Не заполнены этапы
+                  value:
+                    error:
+                      code: COMMISSION_INCOMPLETE
+                      message: "Заполните обязательные поля перед созданием комиссии"
+                      details:
+                        completeness:
+                          complete: false
+                          sections:
+                            - id: stages
+                              complete: false
+                              requiredFields: [fullyFilledStages]
+                              missingFields: [fullyFilledStages]
+                typeNotActivatable:
+                  summary: Тип не ALPHA
+                  value:
+                    error:
+                      code: COMMISSION_TYPE_NOT_ACTIVATABLE
+                      message: "В текущей версии можно запустить только комиссию типа ALPHA"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /commissions/{commissionId}/clone:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+    post:
+      summary: Создать на основе
+      description: |
+        Создаёт новый черновик по существующей КК в любом статусе (FR-A12). Копия сразу появляется
+        в `DRAFT`: правило «КК появляется при первом изменении» к ней не относится.
+
+        Копируются: название с префиксом «Копия — », регламент, тип, грейды, подразделения
+        по `orgUnitId`, этапы без дат, ссылка на шаблон, если он не в архиве.
+        Не копируются: оцениваемые, владельцы комиссии, снимок подразделений.
+        Подразделения, которых больше нет в `OrgStructure`, приходят с `available: false`.
+        Исходная КК не меняется.
+
+        Доступно только владельцам процесса.
+      operationId: cloneCommission
+      tags: [Commission]
+      x-slice: add-commission-clone
+      responses:
+        '201':
+          description: Копия создана
+          headers:
+            Location:
+              description: "URL новой КК"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /grades:
+    get:
+      summary: Справочник грейдов
+      description: |
+        Грейды из внешней системы через `GradeCatalogPort`, в порядке сортировки справочника.
+        Доступно владельцам процесса и (с change 14) владельцам комиссии.
+      operationId: listGrades
+      tags: [Grades]
+      x-slice: add-commission-grades
+      responses:
+        '200':
+          description: Грейды
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Grade"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /org-units:
+    get:
+      summary: Подразделения-кандидаты для КК
+      description: |
+        Подразделения верхнего уровня из `OrgStructure` с руководителем и HRD (FR-A04).
+        Вызывается и до создания КК, поэтому не привязан к `commissionId`: какие из них выбраны,
+        клиент видит по `departments` в КК.
+
+        HRD есть у каждого подразделения: его определяет `HrdResolver`. Если HRD не найден,
+        это ошибка данных справочника, а не доменный сценарий — `500 INTERNAL_ERROR`.
+      operationId: listOrgUnitCandidates
+      tags: [Departments]
+      x-slice: add-commission-departments
+      parameters:
+        - name: level
+          in: query
+          required: false
+          description: "Уровень оргструктуры. В альфе — только верхний"
+          schema:
+            type: string
+            enum: [TOP]
+            default: TOP
+      responses:
+        '200':
+          description: Подразделения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrgUnitCandidateList"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /commissions/{commissionId}/departments/{orgUnitId}:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+      - $ref: "#/components/parameters/OrgUnitId"
+    put:
+      summary: Выбрать подразделение
+      description: |
+        Отмечает подразделение в черновике (FR-A04). Операция идемпотентна: повторная отметка
+        не создаёт дубль и отвечает `200` с тем же состоянием. В черновике хранится только
+        `orgUnitId`; название, руководитель и HRD берутся из структуры при показе.
+
+        Подразделение должно существовать в `OrgStructure` и быть верхнего уровня, иначе `422`.
+        Только в `DRAFT`, иначе `409`.
+      operationId: selectCommissionDepartment
+      tags: [Departments]
+      x-slice: add-commission-departments
+      responses:
+        '200':
+          description: Подразделение выбрано
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+    delete:
+      summary: Снять подразделение
+      description: |
+        Снимает отметку и удаляет подразделение из черновика. Подразделение, которого больше нет
+        в структуре (`available: false`), снять тоже можно.
+
+        С change D9: если в подразделении есть оцениваемые, снять его нельзя —
+        `409 DEPARTMENT_HAS_ASSESSEES`; сначала оцениваемых нужно исключить
+        (решение 01.11, уточняется у бизнеса).
+
+        Только в `DRAFT`, иначе `409 COMMISSION_NOT_DRAFT`. Если подразделение не выбрано — `404`.
+      operationId: unselectCommissionDepartment
+      tags: [Departments]
+      x-slice: add-commission-departments
+      responses:
+        '200':
+          description: Подразделение снято
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/DepartmentNotFound"
+        '409':
+          description: "КК не в `DRAFT` или в подразделении есть оцениваемые"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                notDraft:
+                  value:
+                    error:
+                      code: COMMISSION_NOT_DRAFT
+                      message: "Параметры проведения можно менять только в черновике"
+                hasAssessees:
+                  value:
+                    error:
+                      code: DEPARTMENT_HAS_ASSESSEES
+                      message: "Сначала исключите оцениваемых этого подразделения"
+
+  /commissions/{commissionId}/stages:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+    post:
+      summary: Добавить этап
+      description: |
+        Добавляет этап в конец списка (FR-A06). Частично заполненный этап сохраняется.
+        `dateFrom` не позже `dateTo`, иначе `422`. Только в `DRAFT`.
+      operationId: addCommissionStage
+      tags: [Stages]
+      x-slice: add-commission-stages
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StageInput"
+      responses:
+        '201':
+          description: Этап добавлен; новый этап — последний в `stages`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /commissions/{commissionId}/stages/order:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+    put:
+      summary: Изменить порядок этапов
+      description: |
+        Задаёт порядок целиком: в `stageIds` должны быть все этапы КК ровно по одному разу,
+        иначе `422`. Только в `DRAFT`.
+      operationId: reorderCommissionStages
+      tags: [Stages]
+      x-slice: add-commission-stages
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StageOrder"
+      responses:
+        '200':
+          description: Порядок сохранён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /commissions/{commissionId}/stages/{stageId}:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+      - $ref: "#/components/parameters/StageId"
+    patch:
+      summary: Изменить этап
+      description: |
+        Частичная правка этапа: отсутствующее поле не меняется, `null` очищает поле.
+        После правки `dateFrom` не позже `dateTo`, иначе `422`. Только в `DRAFT`.
+      operationId: updateCommissionStage
+      tags: [Stages]
+      x-slice: add-commission-stages
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StagePatch"
+      responses:
+        '200':
+          description: Этап сохранён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/StageNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+    delete:
+      summary: Удалить этап
+      description: "Удаляет этап; порядок остальных сохраняется. Только в `DRAFT`."
+      operationId: deleteCommissionStage
+      tags: [Stages]
+      x-slice: add-commission-stages
+      responses:
+        '200':
+          description: Этап удалён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/StageNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+
+  /commissions/{commissionId}/departments/{orgUnitId}/assessee-candidates:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+      - $ref: "#/components/parameters/OrgUnitId"
+    get:
+      summary: Кандидаты и оцениваемые подразделения
+      description: |
+        Строки вкладки «Оцениваемые» для одного подразделения КК (FR-A07):
+        - сотрудники подразделения из `OrgStructure`, отфильтрованные по грейдам КК;
+          фильтр снять нельзя (решение 01.11);
+        - плюс уже включённые оцениваемые этого подразделения, в том числе добавленные вручную
+          с другим грейдом или из другого подразделения.
+
+        Кандидатов с выключенным переключателем сервис не хранит: список строится на лету.
+        Грейд, звено и стаж берутся из `OrgStructure` при каждом запросе, ФИО — из `PersonProfile`.
+        Сортировка — по ФИО. Подразделение должно быть выбрано в КК, иначе `404`.
+      operationId: listAssesseeCandidates
+      tags: [Assessees]
+      x-slice: add-draft-assessees
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/Size"
+      responses:
+        '200':
+          description: Страница кандидатов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssesseeCandidatePage"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/DepartmentNotFound"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /commissions/{commissionId}/departments/{orgUnitId}/assessees:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+      - $ref: "#/components/parameters/OrgUnitId"
+    post:
+      summary: Включить оцениваемого
+      description: |
+        Включает переключатель у сотрудника (FR-A08) или добавляет сотрудника вручную (FR-A09).
+
+        Обычное включение (`isManual: false`, change D9):
+        - сотрудник должен быть в этом подразделении и подходить под грейды КК, иначе
+          `422 PERSON_NOT_ELIGIBLE` — человека с другим грейдом добавляют только вручную;
+        - причина рассмотрения обязательна в ALPHA, в BETA и GAMMA — нет.
+
+        Ручное добавление (`isManual: true`, change D10):
+        - сотрудник ищется по всей компании (`GET /people/search`), фильтры не применяются;
+        - попадает в это подразделение сразу включённым с признаком «добавлен»;
+        - причина рассмотрения обязательна в любом типе.
+
+        Человек попадает в КК не больше одного раза: если он уже есть в любом подразделении
+        этой КК — `409 ASSESSEE_ALREADY_INCLUDED`. Только в `DRAFT`. В активной КК состав
+        меняется только через заявку (фаза B).
+      operationId: includeAssessee
+      tags: [Assessees]
+      x-slice: add-draft-assessees
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssesseeInclusionRequest"
+            examples:
+              fromStructure:
+                summary: Включение из списка подразделения
+                value:
+                  personId: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+                  inclusionReason: "Стаж в роли больше пяти лет, кандидат на ротацию"
+              manual:
+                summary: Ручное добавление (с change D10)
+                value:
+                  personId: "9b2e4c1a-0d3f-4a7b-8e6c-5f1d2a3b4c5d"
+                  inclusionReason: "Предложен руководителем блока"
+                  isManual: true
+      responses:
+        '201':
+          description: Оцениваемый включён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssesseeMutationResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/DepartmentNotFound"
+        '409':
+          description: "КК не в `DRAFT` или человек уже есть в этой КК"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                notDraft:
+                  value:
+                    error:
+                      code: COMMISSION_NOT_DRAFT
+                      message: "Состав черновика можно менять только в черновике"
+                alreadyIncluded:
+                  value:
+                    error:
+                      code: ASSESSEE_ALREADY_INCLUDED
+                      message: "Сотрудник уже есть в этой комиссии"
+        '422':
+          description: "Не заполнена обязательная причина или сотрудник не подходит под фильтры"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                reasonRequired:
+                  value:
+                    error:
+                      code: VALIDATION_FAILED
+                      message: "Укажите причину рассмотрения"
+                      fields: [inclusionReason]
+                notEligible:
+                  value:
+                    error:
+                      code: PERSON_NOT_ELIGIBLE
+                      message: "Сотрудник не подходит под подразделение или грейды. Добавьте его вручную"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /commissions/{commissionId}/assessees/{assesseeId}:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+      - $ref: "#/components/parameters/AssesseeId"
+    patch:
+      summary: Изменить причину рассмотрения
+      description: |
+        Правка причины (FR-A08). Автора у причины нет — меняются только аудит-поля строки.
+        В ALPHA и для добавленных вручную очистить причину нельзя — `422`. Только в `DRAFT`.
+      operationId: updateAssesseeReason
+      tags: [Assessees]
+      x-slice: add-draft-assessees
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssesseeReasonPatch"
+      responses:
+        '200':
+          description: Причина сохранена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssesseeMutationResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/AssesseeNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+    delete:
+      summary: Исключить оцениваемого из черновика
+      description: |
+        Выключение переключателя или удаление добавленного вручную (FR-A08, FR-A09).
+        Строка удаляется вместе с причиной; при повторном включении причину вводят заново.
+        Предупреждение перед удалением добавленного вручную показывает клиент.
+
+        Только в `DRAFT`, иначе `409`: в активной КК исключают через заявку `EXCLUDE` (фаза B).
+      operationId: excludeAssesseeFromDraft
+      tags: [Assessees]
+      x-slice: add-draft-assessees
+      responses:
+        '200':
+          description: Оцениваемый исключён; ответ — актуальная заполненность
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompletenessResponse"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/AssesseeNotFound"
+        '409':
+          $ref: "#/components/responses/CommissionNotDraft"
+
+  /people/search:
+    get:
+      summary: Поиск сотрудника по ФИО
+      description: |
+        Поиск по всей компании для ручного добавления оцениваемого (FR-A09) и выдачи доступа
+        владельцу комиссии (FR-A13). Ищет `PersonProfilePort` по подстроке ФИО, подразделение
+        и грейд найденного добавляются из `OrgStructure`. Выдача ограничена `limit`.
+
+        Доступно владельцам процесса и (с change 14) владельцам комиссии. Если `PersonProfile`
+        недоступен — `503`: искать без ФИО нечем.
+      operationId: searchPeople
+      tags: [People]
+      x-slice: add-manual-assessee
+      parameters:
+        - name: query
+          in: query
+          required: true
+          description: "Подстрока ФИО, не короче трёх символов"
+          schema:
+            type: string
+            minLength: 3
+            maxLength: 100
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+      responses:
+        '200':
+          description: Найденные сотрудники
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PersonSearchResult"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /decision-templates:
+    get:
+      summary: Список шаблонов проектов решений
+      description: |
+        Шаблоны — общий ресурс всех владельцев процесса (FR-A05). По умолчанию архивные
+        не возвращаются: при выборе шаблона в КК они не предлагаются (с change C7).
+        Читать список могут владельцы процесса и (с change 14) владельцы комиссии.
+      operationId: listDecisionTemplates
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      parameters:
+        - name: includeArchived
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Шаблоны
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DecisionTemplateSummary"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+    post:
+      summary: Создать шаблон
+      description: |
+        Создаёт шаблон; варианты и поля контекста можно передать сразу или добавить потом.
+        Создают и правят шаблоны владельцы процесса. Могут ли это делать владельцы комиссии,
+        уточняется у бизнеса.
+      operationId: createDecisionTemplate
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecisionTemplateCreateRequest"
+            example:
+              name: "Альфа 2027"
+              options:
+                - name: "Ротация"
+                - name: "Развитие в роли"
+                - name: "Развитие компетенции Disrupt"
+              contextFields:
+                - name: "Сильные стороны"
+                  isRequired: true
+                - name: "Зоны развития"
+                  isRequired: false
+      responses:
+        '201':
+          description: Шаблон создан
+          headers:
+            Location:
+              description: "URL шаблона"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /decision-templates/{templateId}:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+    get:
+      summary: Получить шаблон
+      operationId: getDecisionTemplate
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      responses:
+        '200':
+          description: Шаблон с вариантами и полями контекста в заданном порядке
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+    patch:
+      summary: Переименовать шаблон
+      description: |
+        Используемый шаблон (привязан хотя бы к одной КК вне `DRAFT`, с change 11) менять нельзя —
+        `409 TEMPLATE_IN_USE`. Архивный тоже — `409 TEMPLATE_ARCHIVED`. Черновики, к которым
+        шаблон привязан, видят правку сразу.
+      operationId: renameDecisionTemplate
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecisionTemplatePatch"
+      responses:
+        '200':
+          description: Шаблон сохранён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+    delete:
+      summary: Удалить шаблон
+      description: |
+        Удалить можно только шаблон, не привязанный ни к одной КК. С change C8 привязанный
+        шаблон даёт `409 TEMPLATE_ATTACHED`; используемый шаблон можно только архивировать (C7).
+      operationId: deleteDecisionTemplate
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      responses:
+        '204':
+          description: Шаблон удалён
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+
+  /decision-templates/{templateId}/options:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+    post:
+      summary: Добавить вариант проекта решения
+      description: "Вариант добавляется в конец списка. Ограничения шаблона — как у переименования."
+      operationId: addDecisionOption
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecisionOptionInput"
+      responses:
+        '201':
+          description: Вариант добавлен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /decision-templates/{templateId}/options/order:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+    put:
+      summary: Изменить порядок вариантов
+      description: "В `ids` — все варианты шаблона ровно по одному разу, иначе `422`."
+      operationId: reorderDecisionOptions
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdOrder"
+      responses:
+        '200':
+          description: Порядок сохранён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /decision-templates/{templateId}/options/{optionId}:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+      - $ref: "#/components/parameters/OptionId"
+    patch:
+      summary: Переименовать вариант
+      operationId: renameDecisionOption
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DecisionOptionInput"
+      responses:
+        '200':
+          description: Вариант сохранён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+    delete:
+      summary: Удалить вариант
+      operationId: deleteDecisionOption
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      responses:
+        '200':
+          description: Вариант удалён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+
+  /decision-templates/{templateId}/context-fields:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+    post:
+      summary: Добавить поле контекста
+      description: "Поле добавляется в конец списка. Ограничения шаблона — как у переименования."
+      operationId: addContextField
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContextFieldInput"
+      responses:
+        '201':
+          description: Поле добавлено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /decision-templates/{templateId}/context-fields/order:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+    put:
+      summary: Изменить порядок полей контекста
+      description: "В `ids` — все поля шаблона ровно по одному разу, иначе `422`."
+      operationId: reorderContextFields
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IdOrder"
+      responses:
+        '200':
+          description: Порядок сохранён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /decision-templates/{templateId}/context-fields/{fieldId}:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+      - $ref: "#/components/parameters/FieldId"
+    patch:
+      summary: Изменить поле контекста
+      description: "Частичная правка: название и обязательность."
+      operationId: updateContextField
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContextFieldPatch"
+      responses:
+        '200':
+          description: Поле сохранено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+    delete:
+      summary: Удалить поле контекста
+      operationId: deleteContextField
+      tags: [DecisionTemplates]
+      x-slice: add-decision-templates
+      responses:
+        '200':
+          description: Поле удалено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+        '409':
+          $ref: "#/components/responses/TemplateLocked"
+
+  /decision-templates/{templateId}/copy:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+    post:
+      summary: Создать копию шаблона
+      description: |
+        Новый шаблон «<имя> (копия)» с теми же вариантами и полями контекста, не привязанный
+        ни к одной КК. Так меняют используемый шаблон. Копировать можно и архивный.
+        Не путать с «Создать на основе» для КК.
+      operationId: copyDecisionTemplate
+      tags: [DecisionTemplates]
+      x-slice: add-decision-template-copy-archive
+      responses:
+        '201':
+          description: Копия создана
+          headers:
+            Location:
+              description: "URL копии"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+
+  /decision-templates/{templateId}/archive:
+    parameters:
+      - $ref: "#/components/parameters/TemplateId"
+    post:
+      summary: Архивировать шаблон
+      description: |
+        Архивный шаблон не предлагается при выборе в КК, но остаётся виден в КК, к которым
+        уже привязан, и не копируется при «Создать на основе». Повторная архивация не ошибка.
+        Обратного действия в MVP нет.
+      operationId: archiveDecisionTemplate
+      tags: [DecisionTemplates]
+      x-slice: add-decision-template-copy-archive
+      responses:
+        '200':
+          description: Шаблон в архиве
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DecisionTemplate"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/TemplateNotFound"
+
+  /commissions/{commissionId}/owners:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+    get:
+      summary: Владельцы комиссии
+      description: "Активные владельцы этой КК с ФИО. Владельцы процесса в список не входят."
+      operationId: listCommissionOwners
+      tags: [Owners]
+      x-slice: add-commission-owners
+      responses:
+        '200':
+          description: Владельцы комиссии
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CommissionOwner"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+    post:
+      summary: Выдать доступ к комиссии
+      description: |
+        «Настроить доступ» (FR-A13): сотрудник становится владельцем этой КК. Выдают владелец
+        процесса и владелец этой КК, в любом статусе КК. Сотрудника выбирают через
+        `GET /people/search`. Если доступ уже выдан — `409 OWNER_ALREADY_GRANTED`.
+      operationId: grantCommissionOwner
+      tags: [Owners]
+      x-slice: add-commission-owners
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommissionOwnerGrantRequest"
+      responses:
+        '201':
+          description: Доступ выдан
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommissionOwner"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/CommissionNotFound"
+        '409':
+          description: "Доступ этому сотруднику уже выдан"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: OWNER_ALREADY_GRANTED
+                  message: "У сотрудника уже есть доступ к этой комиссии"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /commissions/{commissionId}/owners/{personId}:
+    parameters:
+      - $ref: "#/components/parameters/CommissionId"
+      - $ref: "#/components/parameters/PersonId"
+    delete:
+      summary: Отозвать доступ к комиссии
+      description: |
+        Мягкий отзыв: в `commission_owner` ставится `revoked_at`, `updated_by` — кто отозвал.
+        Доступ плоский: отозвать можно у любого владельца комиссии, в том числе у того, кто выдал,
+        и у себя. Доступ владельцев процесса идёт от роли и здесь не отзывается — для них `404`.
+      operationId: revokeCommissionOwner
+      tags: [Owners]
+      x-slice: add-commission-owners
+      responses:
+        '204':
+          description: Доступ отозван
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/OwnerNotFound"
+
+  /admin/process-owners:
+    get:
+      summary: Справочник владельцев процесса
+      description: "Все записи, включая неактивные. Только роль поддержки."
+      operationId: listProcessOwners
+      tags: [Admin]
+      x-slice: add-directories-admin
+      responses:
+        '200':
+          description: Владельцы процесса
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProcessOwner"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+    post:
+      summary: Добавить владельца процесса
+      description: |
+        Добавленный сразу получает права. Если человек уже есть в справочнике (даже неактивный) —
+        `409 PROCESS_OWNER_ALREADY_EXISTS`; неактивного включают через `PATCH`.
+      operationId: addProcessOwner
+      tags: [Admin]
+      x-slice: add-directories-admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProcessOwnerCreateRequest"
+      responses:
+        '201':
+          description: Владелец процесса добавлен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessOwner"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '409':
+          description: "Человек уже есть в справочнике"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: PROCESS_OWNER_ALREADY_EXISTS
+                  message: "Сотрудник уже есть в справочнике владельцев процесса"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /admin/process-owners/{processOwnerId}:
+    parameters:
+      - name: processOwnerId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    patch:
+      summary: Изменить владельца процесса
+      description: "Деактивация (`isActive: false`) сразу отнимает права; включение возвращает."
+      operationId: updateProcessOwner
+      tags: [Admin]
+      x-slice: add-directories-admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProcessOwnerPatch"
+      responses:
+        '200':
+          description: Запись сохранена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessOwner"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/DirectoryEntryNotFound"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+  /admin/hrd-assignments:
+    get:
+      summary: Справочник связок HRD ↔ подразделение
+      description: "Все записи. Можно отфильтровать по подразделению или по HRD. Только роль поддержки."
+      operationId: listHrdAssignments
+      tags: [Admin]
+      x-slice: add-directories-admin
+      parameters:
+        - name: orgUnitId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: hrdPersonId
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Связки
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/HrdAssignment"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+    post:
+      summary: Добавить связку
+      description: |
+        `orgUnitId` проверяется через `OrgStructurePort`, иначе `422`. `validTo: null` — бессрочно.
+      operationId: addHrdAssignment
+      tags: [Admin]
+      x-slice: add-directories-admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HrdAssignmentCreateRequest"
+      responses:
+        '201':
+          description: Связка добавлена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HrdAssignment"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+        '503':
+          $ref: "#/components/responses/ExternalServiceUnavailable"
+
+  /admin/hrd-assignments/{assignmentId}:
+    parameters:
+      - name: assignmentId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    patch:
+      summary: Изменить сроки связки
+      description: |
+        Меняются только сроки; чтобы сменить HRD, закрывают старую связку и добавляют новую.
+        Изменения не влияют на уже активированные КК: HRD там зафиксирован в снимке.
+      operationId: updateHrdAssignment
+      tags: [Admin]
+      x-slice: add-directories-admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HrdAssignmentPatch"
+      responses:
+        '200':
+          description: Связка сохранена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HrdAssignment"
+        '401':
+          $ref: "#/components/responses/Unauthorized"
+        '403':
+          $ref: "#/components/responses/AccessDenied"
+        '404':
+          $ref: "#/components/responses/DirectoryEntryNotFound"
+        '422':
+          $ref: "#/components/responses/ValidationFailed"
+
+components:
+  parameters:
+    CommissionId:
+      name: commissionId
+      in: path
+      required: true
+      description: Идентификатор КК, присвоенный сервером
+      schema:
+        type: string
+        format: uuid
+    OrgUnitId:
+      name: orgUnitId
+      in: path
+      required: true
+      description: "UUID подразделения в `OrgStructure`"
+      schema:
+        type: string
+        format: uuid
+    StageId:
+      name: stageId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    AssesseeId:
+      name: assesseeId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TemplateId:
+      name: templateId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OptionId:
+      name: optionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    FieldId:
+      name: fieldId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    PersonId:
+      name: personId
+      in: path
+      required: true
+      description: "UUID человека в `PersonProfile`"
+      schema:
+        type: string
+        format: uuid
+    Page:
+      name: page
+      in: query
+      required: false
+      description: "Номер страницы, с нуля"
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    Size:
+      name: size
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+
+  schemas:
+    # ---------- Комиссия ----------
+    CommissionDraftRequest:
+      type: object
+      description: |
+        Первое изменение формы. Все поля необязательные, `null` или пустой массив — «не задано».
+        Хотя бы одно поле должно быть задано. Поля появляются по change: `title`, `regulation`,
+        `type` — срез 1; `gradeCodes` — A3; `departmentOrgUnitIds` — A4; `stages` — B5;
+        `decisionTemplateId` — C8. Проверки — те же, что у соответствующих правок.
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          nullable: true
+          maxLength: 200
+          description: "Название КК. Очищенное или пустое название считается незаданным"
+        regulation:
+          type: string
+          nullable: true
+          maxLength: 4000
+          description: "Регламент проведения"
+        type:
+          $ref: "#/components/schemas/CommissionType"
+        gradeCodes:
+          type: array
+          nullable: true
+          uniqueItems: true
+          items:
+            type: string
+          description: "Коды грейдов из системы грейдов (change A3)"
+        departmentOrgUnitIds:
+          type: array
+          nullable: true
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+          description: "Выбранные подразделения верхнего уровня (change A4)"
+        stages:
+          type: array
+          nullable: true
+          maxItems: 1
+          items:
+            $ref: "#/components/schemas/StageInput"
+          description: "Первый этап (change B5). Первым изменением может быть только один этап"
+        decisionTemplateId:
+          type: string
+          format: uuid
+          nullable: true
+          description: "Шаблон проектов решений (change C8)"
+      example:
+        title: "Центральный аппарат"
+
+    CommissionParamsPatch:
+      type: object
+      description: |
+        Частичная правка. Отсутствующее поле не меняется, `null` очищает поле.
+        Отправка тела без полей допустима и не меняет черновик.
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          nullable: true
+          maxLength: 200
+        regulation:
+          type: string
+          nullable: true
+          maxLength: 4000
+        type:
+          $ref: "#/components/schemas/CommissionType"
+        gradeCodes:
+          type: array
+          nullable: true
+          uniqueItems: true
+          items:
+            type: string
+          description: "Список целиком; `null` или `[]` — грейды не выбраны (change A3)"
+        decisionTemplateId:
+          type: string
+          format: uuid
+          nullable: true
+          description: "Привязать шаблон; `null` — снять выбор (change C8)"
+
+    CommissionTypeValue:
+      type: string
+      enum:
+        - ALPHA
+        - BETA
+        - GAMMA
+
+    CommissionType:
+      type: string
+      nullable: true
+      description: |
+        Тип КК; `null` — не задан. В черновике допустим любой тип; ограничение
+        «активировать только ALPHA» появляется вместе с активацией (задачка 11).
+      enum:
+        - ALPHA
+        - BETA
+        - GAMMA
+
+    CommissionStatus:
+      type: string
+      description: "Статус КК. В фазе A КК бывает в `DRAFT` и `ACTIVE`; `COMPLETED` — после встречи"
+      enum:
+        - DRAFT
+        - ACTIVE
+        - COMPLETED
+
+    CommissionResponse:
+      type: object
+      required: [commissionId, status, params, author, createdAt, updatedAt, completeness]
+      properties:
+        commissionId:
+          type: string
+          format: uuid
+          description: "Идентификатор КК (в базе — `id`)"
+        status:
+          $ref: "#/components/schemas/CommissionStatus"
+        params:
+          $ref: "#/components/schemas/CommissionParams"
+        author:
+          allOf:
+            - $ref: "#/components/schemas/PersonRef"
+          description: "Автор КК (`created_by`)"
+        createdAt:
+          type: string
+          format: date-time
+          description: "Дата создания"
+        updatedAt:
+          type: string
+          format: date-time
+          description: "Дата последнего изменения"
+        activatedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: "Дата активации из истории статусов; `null` для черновика (change 11)"
+        departments:
+          type: array
+          description: "Выбранные подразделения (change A4). До A4 — пустой массив"
+          items:
+            $ref: "#/components/schemas/CommissionDepartment"
+        stages:
+          type: array
+          description: "Этапы в заданном порядке (change B5). До B5 — пустой массив"
+          items:
+            $ref: "#/components/schemas/Stage"
+        completeness:
+          $ref: "#/components/schemas/Completeness"
+        personProfileAvailable:
+          type: boolean
+          default: true
+          description: |
+            `false`, если `PersonProfile` недоступен. Тогда у людей приходит только `personId`,
+            а `fullName` — `null`. Признак относится к запросу ответа, а не к самим людям:
+            клиент показывает `personId` вместо ФИО.
+
+    CommissionParams:
+      type: object
+      description: "Параметры проведения комиссии. Значение-объект агрегата"
+      required: [title, regulation, type]
+      properties:
+        title:
+          type: string
+          nullable: true
+          description: "Название; `null` — не задано"
+        regulation:
+          type: string
+          nullable: true
+          description: "Регламент; `null` — не задан. Необязателен для заполненности"
+        type:
+          $ref: "#/components/schemas/CommissionType"
+        gradeCodes:
+          type: array
+          description: "Коды выбранных грейдов (change A3). Названия — из `GET /grades`"
+          items:
+            type: string
+        decisionTemplate:
+          allOf:
+            - $ref: "#/components/schemas/DecisionTemplateRef"
+          nullable: true
+          description: "Привязанный шаблон; `null` — не выбран (change C8)"
+
+    CommissionListPage:
+      type: object
+      required: [items, page, size, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CommissionListItem"
+        page:
+          type: integer
+        size:
+          type: integer
+        total:
+          type: integer
+          description: "Всего КК под фильтром"
+        personProfileAvailable:
+          type: boolean
+          default: true
+
+    CommissionListItem:
+      type: object
+      required: [commissionId, title, type, status, author, createdAt, updatedAt]
+      properties:
+        commissionId:
+          type: string
+          format: uuid
+        title:
+          type: string
+          nullable: true
+          description: "`null` — без названия; подпись «Без названия» подставляет клиент"
+        type:
+          $ref: "#/components/schemas/CommissionType"
+        status:
+          $ref: "#/components/schemas/CommissionStatus"
+        author:
+          $ref: "#/components/schemas/PersonRef"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        accessHolders:
+          type: array
+          description: "Владельцы этой КК — колонка «у кого есть доступ» (change 14)"
+          items:
+            $ref: "#/components/schemas/PersonRef"
+
+    # ---------- Грейды ----------
+    Grade:
+      type: object
+      required: [code, name, sortOrder]
+      properties:
+        code:
+          type: string
+          example: G14
+        name:
+          type: string
+          example: "14 грейд"
+        sortOrder:
+          type: integer
+
+    # ---------- Подразделения ----------
+    OrgUnitCandidateList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrgUnitCandidate"
+        personProfileAvailable:
+          type: boolean
+          default: true
+
+    OrgUnitCandidate:
+      type: object
+      required: [orgUnitId, name, head, hrd]
+      properties:
+        orgUnitId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        head:
+          allOf:
+            - $ref: "#/components/schemas/PersonRef"
+          description: "Руководитель подразделения из `OrgStructure`"
+        hrd:
+          allOf:
+            - $ref: "#/components/schemas/PersonRef"
+          description: "HRD через `HrdResolver`; есть у каждого подразделения"
+
+    CommissionDepartment:
+      type: object
+      description: |
+        Подразделение комиссии. В черновике `name`, `head` и `hrd` берутся из структуры при показе,
+        после активации — из снимка (`snapshotAt` заполнен).
+      required: [departmentId, orgUnitId, available]
+      properties:
+        departmentId:
+          type: string
+          format: uuid
+          description: "Идентификатор строки подразделения комиссии"
+        orgUnitId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          nullable: true
+          description: "`null`, если подразделения больше нет в структуре"
+        head:
+          allOf:
+            - $ref: "#/components/schemas/PersonRef"
+          nullable: true
+        hrd:
+          allOf:
+            - $ref: "#/components/schemas/PersonRef"
+          nullable: true
+        available:
+          type: boolean
+          description: |
+            `false` — подразделения больше нет в `OrgStructure`. Только для черновика:
+            клиент показывает пометку «недоступно», такое подразделение можно снять.
+        assesseeCount:
+          type: integer
+          description: "Число оцениваемых (change D9)"
+        status:
+          allOf:
+            - $ref: "#/components/schemas/DepartmentStatus"
+          nullable: true
+          description: "`null` в черновике; после активации — статус подразделения (change 11)"
+        snapshotAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: "Момент снимка; `null` в черновике (change 11)"
+
+    DepartmentStatus:
+      type: string
+      description: "Не заполнено → В процессе → На согласовании → Согласовано. Меняется в фазе B"
+      enum:
+        - NOT_FILLED
+        - IN_PROGRESS
+        - ON_APPROVAL
+        - APPROVED
+
+    # ---------- Этапы ----------
+    StageInput:
+      type: object
+      description: "Новый этап. Все поля необязательны: частично заполненный этап сохраняется"
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          nullable: true
+          maxLength: 200
+        description:
+          type: string
+          nullable: true
+          maxLength: 4000
+        dateFrom:
+          type: string
+          format: date
+          nullable: true
+        dateTo:
+          type: string
+          format: date
+          nullable: true
+
+    StagePatch:
+      type: object
+      description: "Частичная правка этапа. Отсутствующее поле не меняется, `null` очищает поле"
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          nullable: true
+          maxLength: 200
+        description:
+          type: string
+          nullable: true
+          maxLength: 4000
+        dateFrom:
+          type: string
+          format: date
+          nullable: true
+        dateTo:
+          type: string
+          format: date
+          nullable: true
+
+    Stage:
+      type: object
+      required: [stageId, position, title, description, dateFrom, dateTo, complete]
+      properties:
+        stageId:
+          type: string
+          format: uuid
+        position:
+          type: integer
+          description: "Порядковый номер, с нуля"
+        title:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        dateFrom:
+          type: string
+          format: date
+          nullable: true
+        dateTo:
+          type: string
+          format: date
+          nullable: true
+        complete:
+          type: boolean
+          description: "Заполнены все четыре поля"
+
+    StageOrder:
+      type: object
+      required: [stageIds]
+      additionalProperties: false
+      properties:
+        stageIds:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+
+    # ---------- Оцениваемые ----------
+    AssesseeCandidatePage:
+      type: object
+      required: [items, page, size, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssesseeCandidate"
+        page:
+          type: integer
+        size:
+          type: integer
+        total:
+          type: integer
+        personProfileAvailable:
+          type: boolean
+          default: true
+
+    AssesseeCandidate:
+      type: object
+      description: |
+        Строка вкладки «Оцениваемые». `included: false` — кандидат из структуры, в базе его нет.
+        `included: true` — оцениваемый, `assesseeId` и `inclusionReason` заполнены.
+      required: [person, included]
+      properties:
+        person:
+          $ref: "#/components/schemas/PersonRef"
+        gradeCode:
+          type: string
+          nullable: true
+        gradeName:
+          type: string
+          nullable: true
+        subUnitName:
+          type: string
+          nullable: true
+          description: "Звено на уровень ниже подразделения комиссии"
+        tenureInRoleMonths:
+          type: integer
+          nullable: true
+          description: "Стаж в роли, месяцев"
+        included:
+          type: boolean
+        assesseeId:
+          type: string
+          format: uuid
+          nullable: true
+        inclusionReason:
+          type: string
+          nullable: true
+        isManual:
+          type: boolean
+          default: false
+          description: "Добавлен вручную — пометка «добавлен» (change D10)"
+
+    AssesseeInclusionRequest:
+      type: object
+      required: [personId]
+      additionalProperties: false
+      properties:
+        personId:
+          type: string
+          format: uuid
+        inclusionReason:
+          type: string
+          nullable: true
+          maxLength: 4000
+          description: "Обязательна в ALPHA и для ручного добавления; в BETA и GAMMA — нет"
+        isManual:
+          type: boolean
+          default: false
+          description: "Ручное добавление в обход фильтров (change D10)"
+
+    AssesseeReasonPatch:
+      type: object
+      required: [inclusionReason]
+      additionalProperties: false
+      properties:
+        inclusionReason:
+          type: string
+          nullable: true
+          maxLength: 4000
+
+    Assessee:
+      type: object
+      required: [assesseeId, departmentId, orgUnitId, person, inclusionReason, isManual]
+      properties:
+        assesseeId:
+          type: string
+          format: uuid
+        departmentId:
+          type: string
+          format: uuid
+        orgUnitId:
+          type: string
+          format: uuid
+        person:
+          $ref: "#/components/schemas/PersonRef"
+        inclusionReason:
+          type: string
+          nullable: true
+        isManual:
+          type: boolean
+
+    AssesseeMutationResponse:
+      type: object
+      required: [assessee, completeness]
+      properties:
+        assessee:
+          $ref: "#/components/schemas/Assessee"
+        completeness:
+          $ref: "#/components/schemas/Completeness"
+        personProfileAvailable:
+          type: boolean
+          default: true
+
+    CompletenessResponse:
+      type: object
+      required: [completeness]
+      properties:
+        completeness:
+          $ref: "#/components/schemas/Completeness"
+
+    # ---------- Люди ----------
+    PersonRef:
+      type: object
+      description: "Ссылка на человека. Персданные в сервисе не хранятся — только `personId`"
+      required: [personId]
+      properties:
+        personId:
+          type: string
+          format: uuid
+          description: "UUID человека в `PersonProfile`"
+        fullName:
+          type: string
+          nullable: true
+          description: "ФИО из `PersonProfile`; `null`, если профиль недоступен"
+
+    PersonSearchResult:
+      type: object
+      required: [person]
+      properties:
+        person:
+          $ref: "#/components/schemas/PersonRef"
+        orgUnitName:
+          type: string
+          nullable: true
+          description: "Подразделение из `OrgStructure`"
+        gradeName:
+          type: string
+          nullable: true
+
+    # ---------- Шаблоны ----------
+    DecisionTemplateRef:
+      type: object
+      required: [templateId, name, archived]
+      properties:
+        templateId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        archived:
+          type: boolean
+
+    DecisionTemplateSummary:
+      type: object
+      required: [templateId, name, archived, inUse, optionCount, contextFieldCount, updatedAt]
+      properties:
+        templateId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        archived:
+          type: boolean
+          description: "В архиве (change C7)"
+        inUse:
+          type: boolean
+          description: "Используемый: привязан хотя бы к одной КК вне `DRAFT` (change 11)"
+        optionCount:
+          type: integer
+        contextFieldCount:
+          type: integer
+        author:
+          $ref: "#/components/schemas/PersonRef"
+        updatedAt:
+          type: string
+          format: date-time
+
+    DecisionTemplate:
+      type: object
+      required: [templateId, name, archived, inUse, options, contextFields]
+      properties:
+        templateId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        archived:
+          type: boolean
+        inUse:
+          type: boolean
+        options:
+          type: array
+          description: "Варианты проектов решений в заданном порядке"
+          items:
+            $ref: "#/components/schemas/DecisionOption"
+        contextFields:
+          type: array
+          description: "Поля контекста в заданном порядке"
+          items:
+            $ref: "#/components/schemas/ContextField"
+        author:
+          $ref: "#/components/schemas/PersonRef"
+        updatedAt:
+          type: string
+          format: date-time
+
+    DecisionTemplateCreateRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        options:
+          type: array
+          items:
+            $ref: "#/components/schemas/DecisionOptionInput"
+        contextFields:
+          type: array
+          items:
+            $ref: "#/components/schemas/ContextFieldInput"
+
+    DecisionTemplatePatch:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+
+    DecisionOption:
+      type: object
+      required: [optionId, position, name]
+      properties:
+        optionId:
+          type: string
+          format: uuid
+        position:
+          type: integer
+        name:
+          type: string
+
+    DecisionOptionInput:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+
+    ContextField:
+      type: object
+      required: [fieldId, position, name, isRequired]
+      properties:
+        fieldId:
+          type: string
+          format: uuid
+        position:
+          type: integer
+        name:
+          type: string
+        isRequired:
+          type: boolean
+
+    ContextFieldInput:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        isRequired:
+          type: boolean
+          default: false
+
+    ContextFieldPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        isRequired:
+          type: boolean
+
+    IdOrder:
+      type: object
+      required: [ids]
+      additionalProperties: false
+      properties:
+        ids:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+
+    # ---------- Владельцы комиссии ----------
+    CommissionOwner:
+      type: object
+      required: [person, grantedBy, grantedAt]
+      properties:
+        person:
+          $ref: "#/components/schemas/PersonRef"
+        grantedBy:
+          allOf:
+            - $ref: "#/components/schemas/PersonRef"
+          description: "Кто выдал доступ (`created_by`)"
+        grantedAt:
+          type: string
+          format: date-time
+          description: "Когда выдан доступ (`created_at`)"
+
+    CommissionOwnerGrantRequest:
+      type: object
+      required: [personId]
+      additionalProperties: false
+      properties:
+        personId:
+          type: string
+          format: uuid
+
+    # ---------- Справочники ----------
+    ProcessOwner:
+      type: object
+      required: [processOwnerId, person, team, isActive, createdAt, updatedAt]
+      properties:
+        processOwnerId:
+          type: string
+          format: uuid
+        person:
+          $ref: "#/components/schemas/PersonRef"
+        team:
+          type: string
+          nullable: true
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    ProcessOwnerCreateRequest:
+      type: object
+      required: [personId]
+      additionalProperties: false
+      properties:
+        personId:
+          type: string
+          format: uuid
+        team:
+          type: string
+          nullable: true
+          maxLength: 200
+
+    ProcessOwnerPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        team:
+          type: string
+          nullable: true
+          maxLength: 200
+        isActive:
+          type: boolean
+
+    HrdAssignment:
+      type: object
+      required: [assignmentId, orgUnitId, hrd, validFrom, validTo]
+      properties:
+        assignmentId:
+          type: string
+          format: uuid
+        orgUnitId:
+          type: string
+          format: uuid
+        orgUnitName:
+          type: string
+          nullable: true
+        hrd:
+          $ref: "#/components/schemas/PersonRef"
+        validFrom:
+          type: string
+          format: date
+        validTo:
+          type: string
+          format: date
+          nullable: true
+          description: "`null` — бессрочно"
+
+    HrdAssignmentCreateRequest:
+      type: object
+      required: [orgUnitId, hrdPersonId, validFrom]
+      additionalProperties: false
+      properties:
+        orgUnitId:
+          type: string
+          format: uuid
+        hrdPersonId:
+          type: string
+          format: uuid
+        validFrom:
+          type: string
+          format: date
+        validTo:
+          type: string
+          format: date
+          nullable: true
+
+    HrdAssignmentPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        validFrom:
+          type: string
+          format: date
+        validTo:
+          type: string
+          format: date
+          nullable: true
+
+    # ---------- Заполненность ----------
+    Completeness:
+      type: object
+      description: |
+        Заполненность мастера. Формат расширяемый: срезы добавляют разделы и поля,
+        не меняя контракт. Правила по change:
+        - `params`: `title`, `type` — срез 1; `gradeCodes` (≥1 грейд) — A3;
+          `departments` (≥1 подразделение) — A4; `decisionTemplate` — C8;
+        - `stages`: `fullyFilledStages` (≥2 этапа с заполненными всеми полями) — B5;
+        - `assessees`: `assesseesPerDepartment` (≥1 оцениваемый в каждом подразделении)
+          и в ALPHA `inclusionReason` (причина у каждого включённого) — D9.
+      required: [complete, sections]
+      properties:
+        complete:
+          type: boolean
+          description: "Все разделы мастера заполнены. «Создать» доступна только при `true`"
+        sections:
+          type: array
+          description: "Заполненность каждого раздела мастера; порядок не важен, раздел ищут по `id`"
+          items:
+            $ref: "#/components/schemas/SectionCompleteness"
+
+    SectionCompleteness:
+      type: object
+      required: [id, complete, requiredFields, missingFields]
+      properties:
+        id:
+          type: string
+          description: |
+            Идентификатор раздела: `params` («Параметры проведения», срез 1),
+            `stages` («Этапы», B5), `assessees` («Оцениваемые», D9).
+          example: params
+        complete:
+          type: boolean
+          description: "Все обязательные поля раздела заполнены"
+        requiredFields:
+          type: array
+          description: "Какие правила раздела действуют сейчас. Срезы расширяют список"
+          items:
+            type: string
+          example: [title, type]
+        missingFields:
+          type: array
+          description: "Невыполненные правила раздела"
+          items:
+            type: string
+          example: [type]
+        items:
+          type: array
+          description: |
+            Детализация по элементам раздела: какие этапы не заполнены полностью (`stages`),
+            в каких подразделениях нет оцениваемых или у кого нет причины (`assessees`).
+          items:
+            $ref: "#/components/schemas/ItemCompleteness"
+
+    ItemCompleteness:
+      type: object
+      required: [itemId, missingFields]
+      properties:
+        itemId:
+          type: string
+          format: uuid
+          description: "`stageId`, `departmentId` или `assesseeId`"
+        missingFields:
+          type: array
+          items:
+            type: string
+          example: [dateTo]
+
+    # ---------- Ошибки ----------
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - UNAUTHORIZED
+                - ACCESS_DENIED
+                - VALIDATION_FAILED
+                - INTERNAL_ERROR
+                - EXTERNAL_SERVICE_UNAVAILABLE
+                - COMMISSION_NOT_FOUND
+                - COMMISSION_NOT_DRAFT
+                - COMMISSION_INCOMPLETE
+                - COMMISSION_TYPE_NOT_ACTIVATABLE
+                - DEPARTMENT_NOT_FOUND
+                - DEPARTMENT_HAS_ASSESSEES
+                - STAGE_NOT_FOUND
+                - ASSESSEE_NOT_FOUND
+                - ASSESSEE_ALREADY_INCLUDED
+                - PERSON_NOT_ELIGIBLE
+                - TEMPLATE_NOT_FOUND
+                - TEMPLATE_ATTACHED
+                - TEMPLATE_IN_USE
+                - TEMPLATE_ARCHIVED
+                - OWNER_NOT_FOUND
+                - OWNER_ALREADY_GRANTED
+                - DIRECTORY_ENTRY_NOT_FOUND
+                - PROCESS_OWNER_ALREADY_EXISTS
+              description: |
+                Машиночитаемый код. Клиент различает случаи по нему, а не по тексту `message`.
+                `VALIDATION_FAILED` покрывает нарушения формата и допустимых значений, а поля-нарушители
+                перечислены в `fields`. Доменные конфликты имеют свои коды.
+            message:
+              type: string
+              description: "Текст для отображения пользователю"
+            fields:
+              type: array
+              description: "Поля, из-за которых запрос отклонён (только для `VALIDATION_FAILED`)"
+              items:
+                type: string
+              example: [type]
+            details:
+              type: object
+              description: "Дополнительные данные ошибки, например заполненность для `COMMISSION_INCOMPLETE`"
+              additionalProperties: true
+
+  responses:
+    Unauthorized:
+      description: "JWT отсутствует или недействителен"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: "Требуется авторизация"
+    AccessDenied:
+      description: |
+        У пользователя нет роли для этой операции: он не владелец процесса, не владелец этой КК
+        (с change 14) или, для `/admin/*`, у него нет роли поддержки. Ничего не меняется.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: ACCESS_DENIED
+              message: "Недостаточно прав для этого действия"
+    CommissionNotFound:
+      description: "КК с таким идентификатором не существует"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: COMMISSION_NOT_FOUND
+              message: "Кадровая комиссия не найдена"
+    CommissionNotDraft:
+      description: "КК не в статусе `DRAFT`; черновик меняется только до активации"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: COMMISSION_NOT_DRAFT
+              message: "Параметры проведения можно менять только в черновике"
+    DepartmentNotFound:
+      description: "КК не найдена или подразделение не выбрано в этой КК"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: DEPARTMENT_NOT_FOUND
+              message: "Подразделение не выбрано в этой комиссии"
+    StageNotFound:
+      description: "КК или этап не найдены"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: STAGE_NOT_FOUND
+              message: "Этап не найден"
+    AssesseeNotFound:
+      description: "КК или оцениваемый не найдены"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: ASSESSEE_NOT_FOUND
+              message: "Оцениваемый не найден"
+    TemplateNotFound:
+      description: "Шаблон, вариант или поле контекста не найдены"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: TEMPLATE_NOT_FOUND
+              message: "Шаблон проектов решений не найден"
+    TemplateLocked:
+      description: |
+        Шаблон нельзя менять или удалять: он используемый (`TEMPLATE_IN_USE`, с change 11),
+        привязан к КК (`TEMPLATE_ATTACHED`, только для удаления, с change C8)
+        или в архиве (`TEMPLATE_ARCHIVED`, с change C7).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            inUse:
+              value:
+                error:
+                  code: TEMPLATE_IN_USE
+                  message: "Шаблон используется в активной комиссии. Создайте копию"
+            attached:
+              value:
+                error:
+                  code: TEMPLATE_ATTACHED
+                  message: "Шаблон привязан к комиссии и не может быть удалён"
+            archived:
+              value:
+                error:
+                  code: TEMPLATE_ARCHIVED
+                  message: "Шаблон в архиве"
+    OwnerNotFound:
+      description: "КК не найдена или у этого сотрудника нет доступа к ней как у владельца комиссии"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: OWNER_NOT_FOUND
+              message: "У сотрудника нет доступа к этой комиссии"
+    DirectoryEntryNotFound:
+      description: "Запись справочника не найдена"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: DIRECTORY_ENTRY_NOT_FOUND
+              message: "Запись справочника не найдена"
+    ValidationFailed:
+      description: "Недопустимое значение; ничего не меняется"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: VALIDATION_FAILED
+              message: "Недопустимое значение поля"
+              fields: [type]
+    ExternalServiceUnavailable:
+      description: "`OrgStructure`, система грейдов или `PersonProfile` (для поиска) недоступны; ничего не меняется"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: EXTERNAL_SERVICE_UNAVAILABLE
+              message: "Сервис оргструктуры временно недоступен"
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+security:
+  - bearerAuth: []
