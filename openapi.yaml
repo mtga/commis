@@ -27,23 +27,52 @@ info:
 
     Общие правила:
     - Все эндпоинты требуют JWT. `person_id` берётся из токена библиотекой авторизации.
-    - Роль проверяется на каждой операции, иначе `403 ACCESS_DENIED`, ничего не меняется.
+    - Ошибки возвращаются в формате Problem Details (RFC 9457) с `Content-Type: application/problem+json`,
+      схема `Problem`. Клиент различает случаи по полю `type`. Таблица типов — ниже.
+    - Роль проверяется на каждой операции, иначе `403 access-denied`, ничего не меняется.
       - Владелец процесса — активная запись в `process_owner`. Видит и правит все КК.
       - Владелец комиссии (с change 14) — запись в `commission_owner` для этой КК.
         Внутри неё может всё, что владелец процесса, кроме создания КК и «Создать на основе».
       - Роль поддержки (change 15) — роль из библиотеки авторизации, только `/admin/*`.
-    - Ресурс не существует — `404` с кодом `*_NOT_FOUND`.
-    - Правка черновика вне статуса `DRAFT` — `409 COMMISSION_NOT_DRAFT`.
-    - Недопустимое значение — `422 VALIDATION_FAILED`, ничего не меняется. Поля-нарушители — в `fields`.
-    - Конфликт с инвариантом домена — `409` с отдельным кодом, ничего не меняется.
-    - `OrgStructure` или система грейдов недоступны — `503 EXTERNAL_SERVICE_UNAVAILABLE`.
+    - Ресурс не существует — `404` с типом `*-not-found`.
+    - Правка черновика вне статуса `DRAFT` — `409 commission-not-draft`.
+    - Недопустимое значение — `422 validation-failed`, ничего не меняется. Поля-нарушители — в `errors`.
+    - Конфликт с инвариантом домена — `409` с отдельным типом, ничего не меняется.
+    - `OrgStructure` или система грейдов недоступны — `503 external-service-unavailable`.
       `PersonProfile` недоступен — ответ приходит без ФИО, с `personProfileAvailable: false`.
     - Все правки черновика возвращают актуальную КК с заполненностью, кроме оцениваемых:
       их операции возвращают оцениваемого и заполненность, потому что список может быть большим.
     - Даты — ISO-8601: `date-time` в UTC, `date` — календарная дата. `personId` — UUID из `PersonProfile`,
       `orgUnitId` — UUID из `OrgStructure`.
     - Лимиты длины строк — предложение. Окончательные значения фиксирует design.md своего change.
-  version: 0.2.0
+
+    Типы проблем (`type` относительно базового адреса API):
+
+    | `type` | Статус | Когда | Change |
+    | --- | --- | --- | --- |
+    | `about:blank` | 401, 500 | Нет или недействителен JWT; внутренняя ошибка | 1 |
+    | `/problems/access-denied` | 403 | Нет роли для операции | 1 |
+    | `/problems/validation-failed` | 422 | Недопустимое значение; поля — в `errors` | 1 |
+    | `/problems/commission-not-found` | 404 | КК не существует | 1 |
+    | `/problems/commission-not-draft` | 409 | Правка КК вне `DRAFT` | 1 |
+    | `/problems/external-service-unavailable` | 503 | Недоступны `OrgStructure`, грейды или поиск `PersonProfile` | A3 |
+    | `/problems/department-not-found` | 404 | Подразделение не выбрано в КК | A4 |
+    | `/problems/stage-not-found` | 404 | Этап не найден | B5 |
+    | `/problems/template-not-found` | 404 | Шаблон, вариант или поле не найдены | C6 |
+    | `/problems/template-attached` | 409 | Удаление шаблона, привязанного к КК | C8 |
+    | `/problems/template-archived` | 409 | Правка шаблона в архиве | C7 |
+    | `/problems/template-in-use` | 409 | Правка или удаление используемого шаблона | 11 |
+    | `/problems/assessee-not-found` | 404 | Оцениваемый не найден | D9 |
+    | `/problems/assessee-already-included` | 409 | Человек уже есть в этой КК | D9 |
+    | `/problems/person-not-eligible` | 422 | Сотрудник не подходит под подразделение или грейды | D9 |
+    | `/problems/department-has-assessees` | 409 | Снятие подразделения, в котором есть оцениваемые | D9 |
+    | `/problems/commission-incomplete` | 422 | Активация незаполненной КК; заполненность — в `completeness` | 11 |
+    | `/problems/commission-type-not-activatable` | 422 | Активация КК не типа `ALPHA` | 11 |
+    | `/problems/owner-not-found` | 404 | У сотрудника нет доступа к КК как у владельца комиссии | 14 |
+    | `/problems/owner-already-granted` | 409 | Доступ сотруднику уже выдан | 14 |
+    | `/problems/directory-entry-not-found` | 404 | Запись справочника не найдена | 15 |
+    | `/problems/process-owner-already-exists` | 409 | Человек уже есть в справочнике владельцев процесса | 15 |
+  version: 0.3.0
 
 tags:
   - name: Commission
@@ -314,9 +343,9 @@ paths:
       summary: Активировать комиссию («Создать»)
       description: |
         Переводит КК из `DRAFT` в `ACTIVE` (FR-A10, FR-A11, FR-X04). В одной транзакции:
-        - агрегат проверяет все правила заполненности — при нарушении `422 COMMISSION_INCOMPLETE`
-          с заполненностью в `details.completeness`;
-        - проверяет тип — в MVP активируется только `ALPHA`, иначе `422 COMMISSION_TYPE_NOT_ACTIVATABLE`;
+        - агрегат проверяет все правила заполненности — при нарушении `422 commission-incomplete`
+          с заполненностью в поле `completeness`;
+        - проверяет тип — в MVP активируется только `ALPHA`, иначе `422 commission-type-not-activatable`;
         - фиксирует снимок каждого подразделения: название, руководитель, HRD через `HrdResolver`,
           `snapshotAt`; привязка оцениваемых к подразделениям фиксируется, атрибуты людей — нет (ADR-0001);
         - ставит подразделениям статус `NOT_FILLED`;
@@ -346,33 +375,35 @@ paths:
           $ref: "#/components/responses/CommissionNotDraft"
         '422':
           description: |
-            КК нельзя активировать: не заполнены обязательные поля (`COMMISSION_INCOMPLETE`)
-            или тип не `ALPHA` (`COMMISSION_TYPE_NOT_ACTIVATABLE`). Ничего не меняется.
+            КК нельзя активировать: не заполнены обязательные поля (`commission-incomplete`)
+            или тип не `ALPHA` (`commission-type-not-activatable`). Ничего не меняется.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
               examples:
                 incomplete:
                   summary: Не заполнены этапы
                   value:
-                    error:
-                      code: COMMISSION_INCOMPLETE
-                      message: "Заполните обязательные поля перед созданием комиссии"
-                      details:
-                        completeness:
+                    type: /problems/commission-incomplete
+                    title: "Комиссия заполнена не полностью"
+                    status: 422
+                    detail: "Заполните обязательные поля перед созданием комиссии"
+                    instance: /commissions/1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed/activation
+                    completeness:
+                      complete: false
+                      sections:
+                        - id: stages
                           complete: false
-                          sections:
-                            - id: stages
-                              complete: false
-                              requiredFields: [fullyFilledStages]
-                              missingFields: [fullyFilledStages]
+                          requiredFields: [fullyFilledStages]
+                          missingFields: [fullyFilledStages]
                 typeNotActivatable:
                   summary: Тип не ALPHA
                   value:
-                    error:
-                      code: COMMISSION_TYPE_NOT_ACTIVATABLE
-                      message: "В текущей версии можно запустить только комиссию типа ALPHA"
+                    type: /problems/commission-type-not-activatable
+                    title: "Тип комиссии нельзя активировать"
+                    status: 422
+                    detail: "В текущей версии можно запустить только комиссию типа ALPHA"
         '503':
           $ref: "#/components/responses/ExternalServiceUnavailable"
 
@@ -450,7 +481,7 @@ paths:
         клиент видит по `departments` в КК.
 
         HRD есть у каждого подразделения: его определяет `HrdResolver`. Если HRD не найден,
-        это ошибка данных справочника, а не доменный сценарий — `500 INTERNAL_ERROR`.
+        это ошибка данных справочника, а не доменный сценарий — `500`.
       operationId: listOrgUnitCandidates
       tags: [Departments]
       x-slice: add-commission-departments
@@ -519,10 +550,10 @@ paths:
         в структуре (`available: false`), снять тоже можно.
 
         С change D9: если в подразделении есть оцениваемые, снять его нельзя —
-        `409 DEPARTMENT_HAS_ASSESSEES`; сначала оцениваемых нужно исключить
+        `409 department-has-assessees`; сначала оцениваемых нужно исключить
         (решение 01.11, уточняется у бизнеса).
 
-        Только в `DRAFT`, иначе `409 COMMISSION_NOT_DRAFT`. Если подразделение не выбрано — `404`.
+        Только в `DRAFT`, иначе `409 commission-not-draft`. Если подразделение не выбрано — `404`.
       operationId: unselectCommissionDepartment
       tags: [Departments]
       x-slice: add-commission-departments
@@ -542,20 +573,22 @@ paths:
         '409':
           description: "КК не в `DRAFT` или в подразделении есть оцениваемые"
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
               examples:
                 notDraft:
                   value:
-                    error:
-                      code: COMMISSION_NOT_DRAFT
-                      message: "Параметры проведения можно менять только в черновике"
+                    type: /problems/commission-not-draft
+                    title: "Комиссия не в черновике"
+                    status: 409
+                    detail: "Параметры проведения можно менять только в черновике"
                 hasAssessees:
                   value:
-                    error:
-                      code: DEPARTMENT_HAS_ASSESSEES
-                      message: "Сначала исключите оцениваемых этого подразделения"
+                    type: /problems/department-has-assessees
+                    title: "В подразделении есть оцениваемые"
+                    status: 409
+                    detail: "Сначала исключите оцениваемых этого подразделения"
 
   /commissions/{commissionId}/stages:
     parameters:
@@ -733,7 +766,7 @@ paths:
 
         Обычное включение (`isManual: false`, change D9):
         - сотрудник должен быть в этом подразделении и подходить под грейды КК, иначе
-          `422 PERSON_NOT_ELIGIBLE` — человека с другим грейдом добавляют только вручную;
+          `422 person-not-eligible` — человека с другим грейдом добавляют только вручную;
         - причина рассмотрения обязательна в ALPHA, в BETA и GAMMA — нет.
 
         Ручное добавление (`isManual: true`, change D10):
@@ -742,7 +775,7 @@ paths:
         - причина рассмотрения обязательна в любом типе.
 
         Человек попадает в КК не больше одного раза: если он уже есть в любом подразделении
-        этой КК — `409 ASSESSEE_ALREADY_INCLUDED`. Только в `DRAFT`. В активной КК состав
+        этой КК — `409 assessee-already-included`. Только в `DRAFT`. В активной КК состав
         меняется только через заявку (фаза B).
       operationId: includeAssessee
       tags: [Assessees]
@@ -781,38 +814,44 @@ paths:
         '409':
           description: "КК не в `DRAFT` или человек уже есть в этой КК"
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
               examples:
                 notDraft:
                   value:
-                    error:
-                      code: COMMISSION_NOT_DRAFT
-                      message: "Состав черновика можно менять только в черновике"
+                    type: /problems/commission-not-draft
+                    title: "Комиссия не в черновике"
+                    status: 409
+                    detail: "Состав черновика можно менять только в черновике"
                 alreadyIncluded:
                   value:
-                    error:
-                      code: ASSESSEE_ALREADY_INCLUDED
-                      message: "Сотрудник уже есть в этой комиссии"
+                    type: /problems/assessee-already-included
+                    title: "Сотрудник уже в комиссии"
+                    status: 409
+                    detail: "Сотрудник уже есть в этой комиссии"
         '422':
           description: "Не заполнена обязательная причина или сотрудник не подходит под фильтры"
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
               examples:
                 reasonRequired:
                   value:
-                    error:
-                      code: VALIDATION_FAILED
-                      message: "Укажите причину рассмотрения"
-                      fields: [inclusionReason]
+                    type: /problems/validation-failed
+                    title: "Недопустимое значение"
+                    status: 422
+                    detail: "Укажите причину рассмотрения"
+                    errors:
+                      - pointer: "#/inclusionReason"
+                        detail: "Недопустимое или пустое значение"
                 notEligible:
                   value:
-                    error:
-                      code: PERSON_NOT_ELIGIBLE
-                      message: "Сотрудник не подходит под подразделение или грейды. Добавьте его вручную"
+                    type: /problems/person-not-eligible
+                    title: "Сотрудник не подходит под фильтры"
+                    status: 422
+                    detail: "Сотрудник не подходит под подразделение или грейды. Добавьте его вручную"
         '503':
           $ref: "#/components/responses/ExternalServiceUnavailable"
 
@@ -1026,7 +1065,7 @@ paths:
       summary: Переименовать шаблон
       description: |
         Используемый шаблон (привязан хотя бы к одной КК вне `DRAFT`, с change 11) менять нельзя —
-        `409 TEMPLATE_IN_USE`. Архивный тоже — `409 TEMPLATE_ARCHIVED`. Черновики, к которым
+        `409 template-in-use`. Архивный тоже — `409 template-archived`. Черновики, к которым
         шаблон привязан, видят правку сразу.
       operationId: renameDecisionTemplate
       tags: [DecisionTemplates]
@@ -1058,7 +1097,7 @@ paths:
       summary: Удалить шаблон
       description: |
         Удалить можно только шаблон, не привязанный ни к одной КК. С change C8 привязанный
-        шаблон даёт `409 TEMPLATE_ATTACHED`; используемый шаблон можно только архивировать (C7).
+        шаблон даёт `409 template-attached`; используемый шаблон можно только архивировать (C7).
       operationId: deleteDecisionTemplate
       tags: [DecisionTemplates]
       x-slice: add-decision-templates
@@ -1399,7 +1438,7 @@ paths:
       description: |
         «Настроить доступ» (FR-A13): сотрудник становится владельцем этой КК. Выдают владелец
         процесса и владелец этой КК, в любом статусе КК. Сотрудника выбирают через
-        `GET /people/search`. Если доступ уже выдан — `409 OWNER_ALREADY_GRANTED`.
+        `GET /people/search`. Если доступ уже выдан — `409 owner-already-granted`.
       operationId: grantCommissionOwner
       tags: [Owners]
       x-slice: add-commission-owners
@@ -1425,13 +1464,14 @@ paths:
         '409':
           description: "Доступ этому сотруднику уже выдан"
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
               example:
-                error:
-                  code: OWNER_ALREADY_GRANTED
-                  message: "У сотрудника уже есть доступ к этой комиссии"
+                type: /problems/owner-already-granted
+                title: "Доступ уже выдан"
+                status: 409
+                detail: "У сотрудника уже есть доступ к этой комиссии"
         '422':
           $ref: "#/components/responses/ValidationFailed"
 
@@ -1482,7 +1522,7 @@ paths:
       summary: Добавить владельца процесса
       description: |
         Добавленный сразу получает права. Если человек уже есть в справочнике (даже неактивный) —
-        `409 PROCESS_OWNER_ALREADY_EXISTS`; неактивного включают через `PATCH`.
+        `409 process-owner-already-exists`; неактивного включают через `PATCH`.
       operationId: addProcessOwner
       tags: [Admin]
       x-slice: add-directories-admin
@@ -1506,13 +1546,14 @@ paths:
         '409':
           description: "Человек уже есть в справочнике"
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/Problem"
               example:
-                error:
-                  code: PROCESS_OWNER_ALREADY_EXISTS
-                  message: "Сотрудник уже есть в справочнике владельцев процесса"
+                type: /problems/process-owner-already-exists
+                title: "Владелец процесса уже в справочнике"
+                status: 409
+                detail: "Сотрудник уже есть в справочнике владельцев процесса"
         '422':
           $ref: "#/components/responses/ValidationFailed"
 
@@ -2664,207 +2705,253 @@ components:
           example: [dateTo]
 
     # ---------- Ошибки ----------
-    ErrorResponse:
+    Problem:
       type: object
-      required: [error]
+      description: |
+        Ошибка в формате Problem Details (RFC 9457), `Content-Type: application/problem+json`.
+        Клиент различает случаи по `type`, а не по тексту `title` или `detail`.
+        Поля расширения: `errors` — для `validation-failed`, `completeness` — для `commission-incomplete`.
+      required: [type, title, status]
+      additionalProperties: true
       properties:
-        error:
-          type: object
-          required: [code, message]
-          properties:
-            code:
-              type: string
-              enum:
-                - UNAUTHORIZED
-                - ACCESS_DENIED
-                - VALIDATION_FAILED
-                - INTERNAL_ERROR
-                - EXTERNAL_SERVICE_UNAVAILABLE
-                - COMMISSION_NOT_FOUND
-                - COMMISSION_NOT_DRAFT
-                - COMMISSION_INCOMPLETE
-                - COMMISSION_TYPE_NOT_ACTIVATABLE
-                - DEPARTMENT_NOT_FOUND
-                - DEPARTMENT_HAS_ASSESSEES
-                - STAGE_NOT_FOUND
-                - ASSESSEE_NOT_FOUND
-                - ASSESSEE_ALREADY_INCLUDED
-                - PERSON_NOT_ELIGIBLE
-                - TEMPLATE_NOT_FOUND
-                - TEMPLATE_ATTACHED
-                - TEMPLATE_IN_USE
-                - TEMPLATE_ARCHIVED
-                - OWNER_NOT_FOUND
-                - OWNER_ALREADY_GRANTED
-                - DIRECTORY_ENTRY_NOT_FOUND
-                - PROCESS_OWNER_ALREADY_EXISTS
-              description: |
-                Машиночитаемый код. Клиент различает случаи по нему, а не по тексту `message`.
-                `VALIDATION_FAILED` покрывает нарушения формата и допустимых значений, а поля-нарушители
-                перечислены в `fields`. Доменные конфликты имеют свои коды.
-            message:
-              type: string
-              description: "Текст для отображения пользователю"
-            fields:
-              type: array
-              description: "Поля, из-за которых запрос отклонён (только для `VALIDATION_FAILED`)"
-              items:
-                type: string
-              example: [type]
-            details:
-              type: object
-              description: "Дополнительные данные ошибки, например заполненность для `COMMISSION_INCOMPLETE`"
-              additionalProperties: true
+        type:
+          type: string
+          format: uri-reference
+          description: |
+            Тип проблемы. `about:blank` — для `401` и `500`, у них нет доменного смысла, а `title`
+            совпадает с названием HTTP-статуса. Остальные типы — относительные URI `/problems/…`
+            относительно базового адреса API; таблица типов — в описании контракта.
+          enum:
+                - about:blank
+                - /problems/access-denied
+                - /problems/assessee-already-included
+                - /problems/assessee-not-found
+                - /problems/commission-incomplete
+                - /problems/commission-not-draft
+                - /problems/commission-not-found
+                - /problems/commission-type-not-activatable
+                - /problems/department-has-assessees
+                - /problems/department-not-found
+                - /problems/directory-entry-not-found
+                - /problems/external-service-unavailable
+                - /problems/owner-already-granted
+                - /problems/owner-not-found
+                - /problems/person-not-eligible
+                - /problems/process-owner-already-exists
+                - /problems/stage-not-found
+                - /problems/template-archived
+                - /problems/template-attached
+                - /problems/template-in-use
+                - /problems/template-not-found
+                - /problems/validation-failed
+        title:
+          type: string
+          description: "Краткое неизменное описание типа проблемы"
+        status:
+          type: integer
+          description: "HTTP-статус; совпадает со статусом ответа"
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+          description: "Объяснение этого случая для показа пользователю"
+        instance:
+          type: string
+          format: uri-reference
+          description: "Путь запроса, вызвавшего ошибку"
+        errors:
+          type: array
+          description: |
+            Нарушения по полям (только для `validation-failed`). `pointer` — JSON Pointer на поле тела
+            запроса (`#/title`), `parameter` — имя параметра пути или query.
+          items:
+            $ref: "#/components/schemas/ProblemFieldError"
+        completeness:
+          allOf:
+            - $ref: "#/components/schemas/Completeness"
+          description: "Заполненность КК (только для `commission-incomplete`)"
 
+    ProblemFieldError:
+      type: object
+      required: [detail]
+      properties:
+        pointer:
+          type: string
+          description: "JSON Pointer на поле тела запроса"
+          example: "#/inclusionReason"
+        parameter:
+          type: string
+          description: "Имя параметра пути или query"
+          example: query
+        detail:
+          type: string
+          description: "Что не так с полем"
   responses:
     Unauthorized:
       description: "JWT отсутствует или недействителен"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: UNAUTHORIZED
-              message: "Требуется авторизация"
+            type: about:blank
+            title: "Unauthorized"
+            status: 401
+            detail: "Требуется авторизация"
     AccessDenied:
       description: |
         У пользователя нет роли для этой операции: он не владелец процесса, не владелец этой КК
         (с change 14) или, для `/admin/*`, у него нет роли поддержки. Ничего не меняется.
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: ACCESS_DENIED
-              message: "Недостаточно прав для этого действия"
+            type: /problems/access-denied
+            title: "Недостаточно прав"
+            status: 403
+            detail: "Недостаточно прав для этого действия"
     CommissionNotFound:
       description: "КК с таким идентификатором не существует"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: COMMISSION_NOT_FOUND
-              message: "Кадровая комиссия не найдена"
+            type: /problems/commission-not-found
+            title: "Комиссия не найдена"
+            status: 404
+            detail: "Кадровая комиссия не найдена"
     CommissionNotDraft:
       description: "КК не в статусе `DRAFT`; черновик меняется только до активации"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: COMMISSION_NOT_DRAFT
-              message: "Параметры проведения можно менять только в черновике"
+            type: /problems/commission-not-draft
+            title: "Комиссия не в черновике"
+            status: 409
+            detail: "Параметры проведения можно менять только в черновике"
     DepartmentNotFound:
       description: "КК не найдена или подразделение не выбрано в этой КК"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: DEPARTMENT_NOT_FOUND
-              message: "Подразделение не выбрано в этой комиссии"
+            type: /problems/department-not-found
+            title: "Подразделение не выбрано в комиссии"
+            status: 404
+            detail: "Подразделение не выбрано в этой комиссии"
     StageNotFound:
       description: "КК или этап не найдены"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: STAGE_NOT_FOUND
-              message: "Этап не найден"
+            type: /problems/stage-not-found
+            title: "Этап не найден"
+            status: 404
+            detail: "Этап не найден"
     AssesseeNotFound:
       description: "КК или оцениваемый не найдены"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: ASSESSEE_NOT_FOUND
-              message: "Оцениваемый не найден"
+            type: /problems/assessee-not-found
+            title: "Оцениваемый не найден"
+            status: 404
+            detail: "Оцениваемый не найден"
     TemplateNotFound:
       description: "Шаблон, вариант или поле контекста не найдены"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: TEMPLATE_NOT_FOUND
-              message: "Шаблон проектов решений не найден"
+            type: /problems/template-not-found
+            title: "Шаблон не найден"
+            status: 404
+            detail: "Шаблон проектов решений не найден"
     TemplateLocked:
       description: |
-        Шаблон нельзя менять или удалять: он используемый (`TEMPLATE_IN_USE`, с change 11),
-        привязан к КК (`TEMPLATE_ATTACHED`, только для удаления, с change C8)
-        или в архиве (`TEMPLATE_ARCHIVED`, с change C7).
+        Шаблон нельзя менять или удалять: он используемый (`template-in-use`, с change 11),
+        привязан к КК (`template-attached`, только для удаления, с change C8)
+        или в архиве (`template-archived`, с change C7).
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           examples:
             inUse:
               value:
-                error:
-                  code: TEMPLATE_IN_USE
-                  message: "Шаблон используется в активной комиссии. Создайте копию"
+                type: /problems/template-in-use
+                title: "Шаблон используется"
+                status: 409
+                detail: "Шаблон используется в активной комиссии. Создайте копию"
             attached:
               value:
-                error:
-                  code: TEMPLATE_ATTACHED
-                  message: "Шаблон привязан к комиссии и не может быть удалён"
+                type: /problems/template-attached
+                title: "Шаблон привязан к комиссии"
+                status: 409
+                detail: "Шаблон привязан к комиссии и не может быть удалён"
             archived:
               value:
-                error:
-                  code: TEMPLATE_ARCHIVED
-                  message: "Шаблон в архиве"
+                type: /problems/template-archived
+                title: "Шаблон в архиве"
+                status: 409
+                detail: "Шаблон в архиве"
     OwnerNotFound:
       description: "КК не найдена или у этого сотрудника нет доступа к ней как у владельца комиссии"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: OWNER_NOT_FOUND
-              message: "У сотрудника нет доступа к этой комиссии"
+            type: /problems/owner-not-found
+            title: "Владелец комиссии не найден"
+            status: 404
+            detail: "У сотрудника нет доступа к этой комиссии"
     DirectoryEntryNotFound:
       description: "Запись справочника не найдена"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: DIRECTORY_ENTRY_NOT_FOUND
-              message: "Запись справочника не найдена"
+            type: /problems/directory-entry-not-found
+            title: "Запись справочника не найдена"
+            status: 404
+            detail: "Запись справочника не найдена"
     ValidationFailed:
       description: "Недопустимое значение; ничего не меняется"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: VALIDATION_FAILED
-              message: "Недопустимое значение поля"
-              fields: [type]
+            type: /problems/validation-failed
+            title: "Недопустимое значение"
+            status: 422
+            detail: "Недопустимое значение поля"
+            errors:
+              - pointer: "#/type"
+                detail: "Недопустимое или пустое значение"
     ExternalServiceUnavailable:
       description: "`OrgStructure`, система грейдов или `PersonProfile` (для поиска) недоступны; ничего не меняется"
       content:
-        application/json:
+        application/problem+json:
           schema:
-            $ref: "#/components/schemas/ErrorResponse"
+            $ref: "#/components/schemas/Problem"
           example:
-            error:
-              code: EXTERNAL_SERVICE_UNAVAILABLE
-              message: "Сервис оргструктуры временно недоступен"
+            type: /problems/external-service-unavailable
+            title: "Внешний сервис недоступен"
+            status: 503
+            detail: "Сервис оргструктуры временно недоступен"
 
   securitySchemes:
     bearerAuth:
